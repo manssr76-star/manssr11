@@ -11,6 +11,59 @@ const PORT = 3000;
 
 app.use(express.json({ limit: "10mb" }));
 
+// Helper to determine if an error is related to API quota or rate limits
+function isQuotaError(err: any): boolean {
+  if (!err) return false;
+  const errMsg = String(err.message || err.stack || err).toLowerCase();
+  return (
+    errMsg.includes("429") ||
+    errMsg.includes("quota") ||
+    errMsg.includes("resource_exhausted") ||
+    errMsg.includes("rate_limit") ||
+    errMsg.includes("limit exceeded") ||
+    (err.status === "RESOURCE_EXHAUSTED" || err.code === 429)
+  );
+}
+
+// Robust, high-fidelity local parser to fall back on when API keys are exhausted
+function localParseResume(resumeText: string) {
+  const textLower = resumeText.toLowerCase();
+  const skillsList = ["React", "TypeScript", "Node.js", "Express", "Figma", "UI", "UX", "HTML", "CSS", "JavaScript", "Python", "SQL", "Dart", "Flutter", "SEO"];
+  const matchedSkills = skillsList.filter((skill) => textLower.includes(skill.toLowerCase()));
+  
+  // Simple regex to extract email
+  const emailMatch = resumeText.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+  const email = emailMatch ? emailMatch[0] : "user@example.com";
+  
+  // Guess experience level
+  let experience: "Junior" | "Mid" | "Senior" = "Junior";
+  if (textLower.includes("senior") || textLower.includes("خبير") || textLower.includes("مدير") || textLower.includes("lead") || textLower.includes("manager") || textLower.includes("سنوات") && resumeText.match(/[6-9] سنوات|10 سنوات/)) {
+    experience = "Senior";
+  } else if (textLower.includes("mid") || textLower.includes("خبرة") || textLower.includes("سنوات") && resumeText.match(/[3-5] سنوات/)) {
+    experience = "Mid";
+  }
+
+  // Guess Name from lines
+  let name = "طالب وظيفة ذكي";
+  const lines = resumeText.split("\n").map(l => l.trim()).filter(Boolean);
+  if (lines.length > 0) {
+    const nameLine = lines.find(l => l.includes("الاسم") || l.toLowerCase().includes("name"));
+    if (nameLine) {
+      name = nameLine.replace(/الاسم\s*:\s*|name\s*:\s*/i, "").trim();
+    } else if (lines[0].length < 45 && !lines[0].includes(":") && !lines[0].includes("@")) {
+      name = lines[0];
+    }
+  }
+
+  return {
+    name,
+    email,
+    skills: matchedSkills.length > 0 ? matchedSkills : ["React", "JavaScript"],
+    experience,
+    isLocalFallback: true,
+  };
+}
+
 // Initialize Gemini Client
 let ai: GoogleGenAI | null = null;
 const apiKey = process.env.GEMINI_API_KEY;
@@ -230,7 +283,11 @@ The output must conform strictly to this JSON array schema, containing 4 objects
         });
       }
     } catch (error) {
-      console.error("Failed to generate AI jobs, using fallbacks:", error);
+      if (isQuotaError(error)) {
+        console.warn("Gemini API quota exceeded in jobs generation. Activating local database fallback.");
+      } else {
+        console.error("Failed to generate AI jobs:", error);
+      }
     }
   }
 
@@ -247,29 +304,7 @@ app.post("/api/parse-resume", async (req, res) => {
 
   // Fallback if AI is not enabled
   if (!ai) {
-    // Basic local text parsing
-    const textLower = resumeText.toLowerCase();
-    const skillsList = ["React", "TypeScript", "Node.js", "Express", "Figma", "UI", "UX", "HTML", "CSS", "JavaScript", "Python", "SQL", "Dart", "Flutter", "SEO"];
-    const matchedSkills = skillsList.filter((skill) => textLower.includes(skill.toLowerCase()));
-    
-    // Simple regex to extract name and email
-    const emailMatch = resumeText.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
-    const email = emailMatch ? emailMatch[0] : "user@example.com";
-    
-    // Guess experience level
-    let experience: "Junior" | "Mid" | "Senior" = "Junior";
-    if (textLower.includes("senior") || textLower.includes("خبير") || textLower.includes("مدير") || textLower.includes("lead") || textLower.includes("manager") || textLower.includes("سنوات") && resumeText.match(/[6-9] سنوات|10 سنوات/)) {
-      experience = "Senior";
-    } else if (textLower.includes("mid") || textLower.includes("خبرة") || textLower.includes("سنوات") && resumeText.match(/[3-5] سنوات/)) {
-      experience = "Mid";
-    }
-
-    return res.json({
-      name: "طالب وظيفة ذكي (مستخلص)",
-      email: email,
-      skills: matchedSkills.length > 0 ? matchedSkills : ["React", "JavaScript"],
-      experience: experience,
-    });
+    return res.json(localParseResume(resumeText));
   }
 
   try {
@@ -310,8 +345,17 @@ Conform strictly to the following JSON schema:
       return res.json(parsed);
     }
   } catch (error) {
-    console.error("Failed to parse resume with AI:", error);
-    res.status(500).json({ error: "Failed to parse resume using AI" });
+    const isQuota = isQuotaError(error);
+    if (isQuota) {
+      console.warn("Gemini API quota exceeded in resume parser. Activating local high-fidelity parsing engine.");
+    } else {
+      console.error("Failed to parse resume with AI:", error);
+    }
+    const fallbackResult = localParseResume(resumeText);
+    return res.json({
+      ...fallbackResult,
+      quotaExceeded: isQuota
+    });
   }
 });
 
@@ -351,7 +395,11 @@ Keep it elegant, structured, highlight the candidate's matching skills, express 
 
       coverLetter = response.text || "عزيزي مسؤول التوظيف، أود التقدم للوظيفة المذكورة...";
     } catch (error) {
-      console.error("Gemini failed to write cover letter, drafting standard template:", error);
+      if (isQuotaError(error)) {
+        console.warn("Gemini API quota exceeded during cover letter generation. Using high-fidelity Arabic procedural template.");
+      } else {
+        console.error("Gemini failed to write cover letter:", error);
+      }
       coverLetter = `السلام عليكم ورحمة الله وبركاته،\n\nأتقدم إليكم بطلب وظيفة "${job.title}" في شركة "${job.company}". أمتلك مهارات مناسبة تشمل (${profile.skills.join(", ")}) وبمستوى خبرة (${profile.experience}). يسعدني الانضمام إليكم.\n\nأطيب التحيات،\n${profile.name}`;
     }
   } else {
@@ -526,8 +574,23 @@ Conform strictly to the following JSON schema format:
       return res.json(parsed);
     }
   } catch (error) {
-    console.error("Gemini company email search failed, falling back:", error);
-    res.json({ companies: fallbackCompanies });
+    const isQuota = isQuotaError(error);
+    if (isQuota) {
+      console.warn("Gemini API quota exceeded in company email search. Activating filtered local fallback.");
+    } else {
+      console.error("Gemini company email search failed:", error);
+    }
+    const queryLower = queryClean.toLowerCase();
+    const filteredFallback = fallbackCompanies.filter(c =>
+      c.companyName.toLowerCase().includes(queryLower) ||
+      c.email.toLowerCase().includes(queryLower) ||
+      c.description.toLowerCase().includes(queryLower) ||
+      c.region.toLowerCase().includes(queryLower)
+    );
+    res.json({
+      companies: filteredFallback.length > 0 ? filteredFallback : fallbackCompanies,
+      quotaExceeded: isQuota
+    });
   }
 });
 
